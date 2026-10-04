@@ -25,6 +25,46 @@ On a unified-memory box there is no discrete VRAM to catch an over-allocation �
 | Last-resort guard | `earlyoom` (version not recorded); `EARLYOOM_ARGS="-M 524288,102400 -s 100 --avoid sshd"` in `/etc/default/earlyoom`. The two `-M` values are KiB memory thresholds (524288 KiB ≈ 512 MB, then 102400 KiB ≈ 100 MB) that trigger on available memory; `-s 100` sends SIGTERM at 100 % of the threshold; `--avoid sshd` skips any process whose name matches `sshd`. |
 | Evaluation | Our private 11-category eval bank (questions not published); category names (e.g. `c1-kbqa` … `c10-sre-ops`) and item IDs may be cited, the question content is not published |
 
+## Update (2026-10): what headless actually saves, what retiring idle services saved, and three audit pitfalls
+
+This section adds measurements from a headless-vs-desktop audit and a service-retirement audit, both performed 2026-09-04 on the same two-node pair described above.
+
+### A. Headless A/B (measured once, one node, 2026-09-04)
+
+Machines: two Dell Pro Max with GB10 (121 GB unified memory), Ubuntu 24.04.4, kernel 6.17.0-1014-nvidia, NVIDIA open driver 580.142 (DGX OS 7.5.0), both up 12 days, both running the production vLLM stack (tensor parallel 2). These conditions belong to this audit only and do not describe earlier incidents.
+
+On the node that had only a login-greeter session (no active user desktop), the display manager was stopped online, measured, then restarted. MemAvailable went from 8,911 MB to 9,129 MB (+218 MB); SwapFree rose by 191 MB; graphics-process entries in `nvidia-smi` (59 MiB) dropped to zero. A 1-token completion before and after, and a tensor-parallel-2 completion, behaved normally; no NVRM errors appeared in `dmesg`; the greeter returned after restart.
+
+On the other node, which had a full desktop auto-login session and only about 1.6 GB free at the time, the GUI process RSS totalled 326 MB (plus about 103 MB of its pages in swap) and graphics entries were 24 MiB; the extrapolated saving is about 0.45 GB, estimated from RSS + swap + graphics entries — not a measured A/B.
+
+GUI process RSS on the greeter-only node was 228 MB (plus about 54 MB in swap).
+
+The display stack therefore accounts for 0.2–0.45 GB per node. That is small next to the 2 GB firmware display carveout already listed in the Hardware table above, and small next to the numbers in section B below. We decided not to switch the nodes to a non-graphical boot target.
+
+**Not verified:** this was an online stop/start of the display manager, not a boot into the multi-user target. Boot-time effects (for example on interconnect interrupt placement) were not measured. The full-session node's 0.45 GB is an extrapolation, not a measured A/B. That the 2 GB firmware display carveout cannot be recovered by stopping the display manager comes from vendor release notes as summarised in our notes; we did not compare MemTotal before and after.
+
+### B. Retiring unused resident services (measured once, one node, 2026-09-04, 20:03–20:10 local)
+
+About 20 groups of items found unused by an audit (no references in any of our configs, no requests in 30–60 days, no client connections) were retired: desktop / remote-desktop / VNC helpers, printing, Bluetooth and modem daemons, an NFS server exporting to a dead address, two web admin panels, small data-API and file-sync side services, leftovers from a retired agent project, and an idle multimodal-embedding helper process. The production inference container kept running throughout.
+
+Result on the node that had the full desktop session: MemAvailable 5,255 MB -> 7,271 MB (+2.0 GB); swap used 7,449 MB -> 5,549 MB (-1.9 GB); GPU memory held by the embedding helper 1,848 MiB -> 0. A 1-token completion and the disaster-recovery services checked afterwards were fine.
+
+Where the gain came from: one idle helper held 1,848 MiB of GPU memory (which on this platform draws from the same pool as system memory) plus about 1.3 GB of swapped pages. The per-item sizes in the audit for everything else add up to roughly 0.3 GB (estimate). Most of the 2.0 GB came from one idle resident process, not from the desktop stack.
+
+On the same machines, same day: going headless ~0.2–0.45 GB per node (A) versus retiring idle resident services ~2.0 GB on one node (B). Audit resident services before changing boot targets.
+
+On the other node, a stale worker unit had restarted 279,769 times, including 21,451 attempts in 24 hours to launch a container image tag that no longer existed (registry reply "manifest unknown"). This consumed anonymous registry pull quota and filled the journal. Its memory footprint was negligible, so a memory-only audit would not have flagged it. Whether the unit was enabled at the time is not recorded.
+
+**Not verified:** the 2.0 GB figure is one measurement on one node taken right after the retirement; it was not repeated later and is not broken down per item. Whether the nodes drifted back is not recorded.
+
+### C. Three audit pitfalls (observed once each, 2026-09-04)
+
+1. **A unit that is "disabled" can still run.** Two retired chat-bot gateway services on one node were disabled (not linked into any wants directory) yet kept running: a watchdog timer (started 60 s after boot, then every 120 s, with at most 3 restarts per 15 minutes) restarted them. One of them logged 786 failed logins in 24 hours (invalid token) and held about 243 MB plus 270 MB in swap; the other held about 381 MB plus 264 MB in swap. Check `timers.target.wants` and `systemctl --user list-timers`; disable the timer first, then the services. After doing so on that node: MemAvailable 5,566 MB -> 5,924 MB, swap used 7,955 MB -> 7,456 MB, still inactive five minutes later.
+
+2. **Under a live desktop session, `systemctl disable` does not keep Bluetooth off.** It is re-activated over D-Bus. Use `mask`.
+
+3. **A "zero references" check can miss a configuration file.** A retired embedding helper had one consumer, an application's JSON config file that was not in the grep set; image search stopped working until it was noticed the next day (2026-09-05). Archiving the removed unit files before deleting them is what made rollback possible. Check references across every config location, and run one end-to-end query per retired service.
+
 ## How to reproduce
 
 The incidents below were run in this order. Prerequisites we did **not** record and therefore cannot state: the exact head/worker node addresses (use `<HEAD_IP>` / `<WORKER_IP>`), the home-directory path for the evidence logs (use `~`), the exact kernel command line at each launch, the OS/kernel/driver/CUDA versions, the vLLM/PyTorch/loader versions, the public source of the weights, the complete launch commands, and the test inputs. Where the upstream repo for a pinned revision is not recorded, that is stated. If you need an address, path or version, mark it explicitly rather than guessing.
@@ -66,7 +106,7 @@ Swap peak **23 G**; of the six rounds, **3** reached the OOM at shard ~109/120 (
 ### Incident 3 — `earlyoom` over-trigger on the worker node (2026-08-30/31, audited 2026-09-04)
 
 #### What we saw
-During the GLM window, `Worker_TP` was SIGTERMed 2 min into a legitimate load; five SIGTERMs were recorded on 8/30–31. On 2026-09-04 a headless-vs-desktop audit on both nodes recorded the over-triggering at MemAvailable ≤ 7472 MB (measured 6.64 % / 8270 MB at audit time).
+During the GLM window, `Worker_TP` was SIGTERMed 2 min into a legitimate load; five SIGTERMs were recorded on 8/30–31. On 2026-09-04 a headless-vs-desktop audit on both nodes recorded the over-triggering at MemAvailable ≤ 7472 MB (measured 6.64 % / 8270 MB at audit time). The same audit also measured what going headless would save; those numbers and a later service-retirement measurement are in the Update (2026-10) section.
 
 #### Why
 The old `-m 6` kill line fired at MemAvailable ≤ 7472 MB — far too eager for a 121 GB unified-memory box where transient pressure during a legitimate load is normal.
